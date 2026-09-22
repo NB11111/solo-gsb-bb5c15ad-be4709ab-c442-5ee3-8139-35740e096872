@@ -151,3 +151,90 @@ class CarrierExclusionResult(BaseModel):
     exclusion_ranges: list[ExclusionRange] = Field(
         ..., description="不宜新增载频的闭区间，按起点升序，互不重叠且互不相邻"
     )
+
+
+# ------------------------------------------------ 跨站点冲突检测
+
+class CrossSiteConflictsRequest(BaseModel):
+    """跨站点互调冲突检测请求：2～8 个已保存站点 ID 与频率容差。"""
+
+    site_ids: list[int] = Field(
+        ..., min_length=2, max_length=8, description="已保存站点 ID 列表，取 2～8 个，不允许重复"
+    )
+    tolerance_hz: int = Field(
+        ...,
+        ge=0,
+        description="频率容差（整数 Hz）：不同站点产物频率差不超过该值即判为冲突配对；0 表示仅同频配对",
+    )
+
+    @field_validator("site_ids")
+    @classmethod
+    def _check_site_ids(cls, v: list[int]) -> list[int]:
+        if any(site_id <= 0 for site_id in v):
+            raise ValueError("site ids must be positive integers")
+        if len(set(v)) != len(v):
+            raise ValueError("duplicate site ids are not allowed")
+        return v
+
+
+class ConflictProduct(BaseModel):
+    """冲突簇中的一个产物节点：来自某站点最近一次分析的一条产物。"""
+
+    site_id: int = Field(..., description="产物所属站点 ID")
+    freq_hz: int = Field(..., description="产物频率，整数 Hz")
+    distance_hz: int = Field(..., description="该产物在其所属站点分析中到命中对象的最短距离")
+
+
+class ConflictPair(BaseModel):
+    """一条跨站点冲突配对：两个不同站点的产物频率差不超过容差。"""
+
+    site_a_id: int = Field(..., description="配对中较小的站点 ID")
+    product_a_freq_hz: int = Field(..., description="站点 A 的产物频率，整数 Hz")
+    site_b_id: int = Field(..., description="配对中较大的站点 ID")
+    product_b_freq_hz: int = Field(..., description="站点 B 的产物频率，整数 Hz")
+    frequency_delta_hz: int = Field(
+        ..., description="两个产物的频率差绝对值 |fa - fb|，不超过请求容差"
+    )
+
+
+class ConflictCluster(BaseModel):
+    """一个冲突簇：跨站点冲突配对图上的一个连通分量。
+
+    节点为各站点产物 (site_id, freq_hz)，仅在不同站点的近频产物之间连边；
+    同一站点的产物即使频率相近也不直接相连，只能经其他站点的配对链式传递归簇。
+    """
+
+    cluster_id: int = Field(
+        ..., description="簇编号：按簇内最小 (站点 ID, 产物频率) 节点升序后从 1 连续编号"
+    )
+    site_ids: list[int] = Field(..., description="簇内涉及的全部站点 ID，升序去重")
+    products: list[ConflictProduct] = Field(
+        ..., description="簇内全部产物节点，按 (site_id, freq_hz) 升序"
+    )
+    min_distance_hz: int = Field(
+        ..., description="簇内全部产物到各自命中对象的最小距离（distance_hz 的最小值）"
+    )
+    pair_count: int = Field(..., description="簇内冲突配对数量，等于 pairs 的长度")
+    pairs: list[ConflictPair] = Field(
+        ...,
+        description="簇内全部跨站点配对明细，按 (站点 A, 产物 A, 站点 B, 产物 B) 升序",
+    )
+
+
+class SiteAnalysisRef(BaseModel):
+    """本次检测实际读取的站点最近一次分析的引用。"""
+
+    site_id: int
+    analysis_id: int = Field(..., description="该站点最近一次（按分析 id 最大）分析记录 ID")
+
+
+class CrossSiteConflictsResponse(BaseModel):
+    """跨站点冲突检测结果：无冲突时 clusters 为空列表。"""
+
+    site_ids: list[int] = Field(..., description="回显请求中的站点 ID（保持请求顺序）")
+    tolerance_hz: int
+    analyses: list[SiteAnalysisRef] = Field(
+        ..., description="各站点实际使用的最近一次分析引用，与请求 site_ids 同序"
+    )
+    cluster_count: int = Field(..., description="冲突簇数量，等于 clusters 的长度")
+    clusters: list[ConflictCluster] = Field(..., description="冲突簇列表，cluster_id 从 1 连续编号")

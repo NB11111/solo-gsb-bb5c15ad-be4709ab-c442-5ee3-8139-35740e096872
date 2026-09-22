@@ -107,6 +107,74 @@ docker compose up --build
 }
 ```
 
+## 跨站点冲突检测（cross-site conflicts）
+
+`POST /cross-site-conflicts` 接收 **2～8 个已保存站点 ID** 与非负整数频率容差
+`tolerance_hz`（`0` 表示仅同频配对；站点数越界、ID 重复或非正、容差非法 → `422`），
+读取每个站点**最近一次**分析结果（不重新扫描；站点不存在 → `404`，存在但尚无分析 → `404`）。
+
+- **配对规则**：仅在**不同站点**的产物之间匹配——两个产物频率差绝对值
+  `|fa − fb| ≤ tolerance_hz` 即构成一条跨站点冲突配对；**同一站点**的产物即使频率相近也
+  不直接配对。逐对站点在两列按频率升序的产物上以滑动窗口枚举容差窗口内的配对。
+- **冲突簇**：把每条产物 `(site_id, freq_hz)` 视为节点、每条跨站配对视为无向边，
+  用并查集求连通分量；每个连通分量即一个冲突簇。同站产物只能经**其他站点**的配对
+  链式传递归簇（站点 A 的两个近频产物分别与站点 B 的不同产物配对时才会并入同一簇）。
+- **每簇字段**：`site_ids`（涉及站点，升序去重）、`products`（簇内全部产物频率及其
+  在本站分析中的 `distance_hz`）、`min_distance_hz`（簇内产物最小距离）、
+  `pairs`（全部配对明细，含 `frequency_delta_hz`）与 `pair_count`。
+- **稳定编号**：簇按簇内最小节点 `(站点 ID, 产物频率)` 升序排序后 `cluster_id` 从 1
+  连续编号；配对明细按 `(站点 A, 产物 A, 站点 B, 产物 B)` 升序（A 为较小站点 ID），
+  重复请求结果稳定可复现。无跨站近频配对时返回 `200` 且 `clusters` 为空列表 `[]`。
+
+请求与响应示例（三个站点的产物经跨站边链式相连，`tolerance_hz=10`）：
+
+```bash
+curl -X POST http://localhost:8000/cross-site-conflicts \
+  -H 'Content-Type: application/json' \
+  -d '{"site_ids": [1, 2, 3], "tolerance_hz": 10}'
+```
+
+```json
+{
+  "site_ids": [1, 2, 3],
+  "tolerance_hz": 10,
+  "analyses": [
+    {"site_id": 1, "analysis_id": 1},
+    {"site_id": 2, "analysis_id": 2},
+    {"site_id": 3, "analysis_id": 3}
+  ],
+  "cluster_count": 1,
+  "clusters": [
+    {
+      "cluster_id": 1,
+      "site_ids": [1, 2, 3],
+      "products": [
+        {"site_id": 1, "freq_hz": 990, "distance_hz": 10},
+        {"site_id": 1, "freq_hz": 1020, "distance_hz": 10},
+        {"site_id": 2, "freq_hz": 1000, "distance_hz": 10},
+        {"site_id": 2, "freq_hz": 1030, "distance_hz": 10},
+        {"site_id": 3, "freq_hz": 1010, "distance_hz": 10},
+        {"site_id": 3, "freq_hz": 1040, "distance_hz": 10}
+      ],
+      "min_distance_hz": 10,
+      "pair_count": 5,
+      "pairs": [
+        {"site_a_id": 1, "product_a_freq_hz": 990, "site_b_id": 2,
+         "product_b_freq_hz": 1000, "frequency_delta_hz": 10},
+        {"site_a_id": 1, "product_a_freq_hz": 1020, "site_b_id": 2,
+         "product_b_freq_hz": 1030, "frequency_delta_hz": 10},
+        {"site_a_id": 1, "product_a_freq_hz": 1020, "site_b_id": 3,
+         "product_b_freq_hz": 1010, "frequency_delta_hz": 10},
+        {"site_a_id": 2, "product_a_freq_hz": 1000, "site_b_id": 3,
+         "product_b_freq_hz": 1010, "frequency_delta_hz": 10},
+        {"site_a_id": 2, "product_a_freq_hz": 1030, "site_b_id": 3,
+         "product_b_freq_hz": 1040, "frequency_delta_hz": 10}
+      ]
+    }
+  ]
+}
+```
+
 ## 校验规则（整批拒绝）
 
 - 载频必须为正整数 Hz 且**不得重复**；至少 1 个载频。
@@ -131,6 +199,7 @@ docker compose up --build
 | `GET` | `/analyses/{analysis_id}` | 按 id 查询已保存的分析结果 |
 | `GET` | `/analyses/{analysis_id}/risk-groups` | 按已保存分析结果生成风险分组（违规产物 ↔ 来源载频的二部图连通分量） |
 | `GET` | `/analyses/{analysis_id}/mitigation-plan?max_disabled=k` | 按已保存分析结果求最小停用载频集合（精确最小点覆盖，`max_disabled` 取 1～8；上限内无解返回 `feasible=false` 与未消除产物频率） |
+| `POST` | `/cross-site-conflicts` | 跨站点冲突检测：2～8 个站点最近分析的近频产物配对，按连通分量聚合为冲突簇（站点不存在/无分析 → 404，参数非法 → 422） |
 
 ### 示例
 
@@ -162,6 +231,11 @@ curl 'http://localhost:8000/analyses/1/mitigation-plan?max_disabled=2'
 
 # 查询候选范围 [1, 10000] 内不宜新增载频的区间（不执行或保存分析）
 curl 'http://localhost:8000/sites/1/carrier-exclusion-ranges?candidate_start_hz=1&candidate_end_hz=10000'
+
+# 跨站点冲突检测（读取各站点最近一次分析，频率容差 10 Hz）
+curl -X POST http://localhost:8000/cross-site-conflicts \
+  -H 'Content-Type: application/json' \
+  -d '{"site_ids": [1, 2, 3], "tolerance_hz": 10}'
 ```
 
 分析响应节选：
@@ -230,7 +304,7 @@ curl 'http://localhost:8000/sites/1/carrier-exclusion-ranges?candidate_start_hz=
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-# 运行测试（36 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、新增载频禁用区间）
+# 运行测试（47 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、新增载频禁用区间、跨站点冲突检测）
 pytest
 
 # 启动服务，API 位于 http://127.0.0.1:8000
@@ -248,8 +322,8 @@ uvicorn app.main:app --reload
 ```
 app/
   main.py       # FastAPI 应用与路由，启动时初始化数据库
-  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）、停用方案（精确最小点覆盖）、新增载频禁用区间反解
-  database.py   # SQLite 建表与读写（单事务批量写入）
+  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）、停用方案（精确最小点覆盖）、新增载频禁用区间反解、跨站点冲突配对与连通分量聚合
+  database.py   # SQLite 建表与读写（单事务批量写入、跨站点最近分析批量查询）
   schemas.py    # Pydantic 请求/响应模型与校验
 tests/
   test_api.py   # 端到端测试（TestClient + 临时数据库）

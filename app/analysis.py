@@ -1,7 +1,13 @@
 """三阶互调产物分析：枚举 2*fa - fb，聚合来源并评估最近命中对象。"""
 from __future__ import annotations
 
+from typing import Sequence
+
 from .schemas import (
+    AnalysisResult,
+    ConflictCluster,
+    ConflictPair,
+    ConflictProduct,
     ExclusionRange,
     GuardBand,
     HitObject,
@@ -681,3 +687,115 @@ def carrier_exclusion_ranges(
         else:
             merged.append(ExclusionRange(start_hz=lo, end_hz=hi))
     return merged
+
+
+def build_cross_site_conflicts(
+    analyses: Sequence[AnalysisResult], tolerance_hz: int
+) -> list[ConflictCluster]:
+    """在不同站点最近一次分析的产物之间匹配近频配对，并按连通分量聚合为冲突簇。
+
+    仅在**不同站点**、频率差绝对值不超过 tolerance_hz 的产物之间建立配对；
+    同一站点的产物即使近频也不直接连边，只能经其他站点的配对链式传递归簇。
+    配对图（节点为 (site_id, freq_hz)）的每个连通分量即一个冲突簇。
+    各站点产物在单站点分析内同频已聚合，频率唯一；逐对站点取两列升序产物，
+    滑动窗口枚举容差窗口内的跨站配对，避免两两全比较。簇按簇内最小节点
+    (site_id, freq_hz) 升序编号，配对明细按 (站点 A, 产物 A, 站点 B, 产物 B)
+    升序，结果稳定可复现；无任何跨站近频配对时返回空列表。
+    """
+    products_by_site: dict[int, list[ProductOut]] = {
+        result.site_id: sorted(result.products, key=lambda p: p.freq_hz)
+        for result in analyses
+    }
+    distance_of: dict[tuple[int, int], int] = {
+        (result.site_id, p.freq_hz): p.distance_hz
+        for result in analyses
+        for p in result.products
+    }
+    site_ids = sorted(products_by_site)
+
+    # 并查集：只有至少参与一条跨站配对的产物节点才会注册
+    parent: dict[tuple[int, int], tuple[int, int]] = {}
+
+    def find(node: tuple[int, int]) -> tuple[int, int]:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]  # 路径压缩
+            node = parent[node]
+        return node
+
+    def link(a: tuple[int, int], b: tuple[int, int]) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    pair_keys: set[tuple[int, int, int, int]] = set()
+
+    # 逐对站点：两列产物均按频率升序，j_lo 随当前产物频率单调右移，枚举
+    # fb ∈ [fa - t, fa + t] 内的全部跨站配对（配对无向，站点对只遍历一次）
+    for ai in range(len(site_ids)):
+        for bi in range(ai + 1, len(site_ids)):
+            sa, sb = site_ids[ai], site_ids[bi]
+            prods_a, prods_b = products_by_site[sa], products_by_site[sb]
+            j_lo = 0
+            for product_a in prods_a:
+                lower = product_a.freq_hz - tolerance_hz
+                while j_lo < len(prods_b) and prods_b[j_lo].freq_hz < lower:
+                    j_lo += 1
+                j = j_lo
+                while (
+                    j < len(prods_b)
+                    and prods_b[j].freq_hz <= product_a.freq_hz + tolerance_hz
+                ):
+                    node_a = (sa, product_a.freq_hz)
+                    node_b = (sb, prods_b[j].freq_hz)
+                    parent.setdefault(node_a, node_a)
+                    parent.setdefault(node_b, node_b)
+                    link(node_a, node_b)
+                    pair_keys.add((sa, product_a.freq_hz, sb, prods_b[j].freq_hz))
+                    j += 1
+
+    components: dict[tuple[int, int], set[tuple[int, int]]] = {}
+    for node in list(parent):
+        components.setdefault(find(node), set()).add(node)
+
+    clusters: list[ConflictCluster] = []
+    for cluster_id, root in enumerate(
+        sorted(components, key=lambda r: min(components[r])), start=1
+    ):
+        nodes = sorted(components[root])
+        pairs = sorted(
+            (
+                ConflictPair(
+                    site_a_id=sa,
+                    product_a_freq_hz=fa,
+                    site_b_id=sb,
+                    product_b_freq_hz=fb,
+                    frequency_delta_hz=abs(fa - fb),
+                )
+                for sa, fa, sb, fb in pair_keys
+                if find((sa, fa)) == root
+            ),
+            key=lambda p: (
+                p.site_a_id,
+                p.product_a_freq_hz,
+                p.site_b_id,
+                p.product_b_freq_hz,
+            ),
+        )
+        clusters.append(
+            ConflictCluster(
+                cluster_id=cluster_id,
+                site_ids=sorted({site_id for site_id, _ in nodes}),
+                products=[
+                    ConflictProduct(
+                        site_id=site_id,
+                        freq_hz=freq,
+                        distance_hz=distance_of[(site_id, freq)],
+                    )
+                    for site_id, freq in nodes
+                ],
+                min_distance_hz=min(distance_of[node] for node in nodes),
+                pair_count=len(pairs),
+                pairs=pairs,
+            )
+        )
+    return clusters

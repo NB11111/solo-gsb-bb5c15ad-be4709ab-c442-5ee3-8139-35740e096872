@@ -199,3 +199,36 @@ def list_analyses(site_id: int) -> list[AnalysisMeta]:
         )
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------- 跨站点批量查询
+
+def fetch_existing_site_ids(site_ids: list[int]) -> set[int]:
+    """返回给定 id 中实际存在的站点 id 集合（单次查询）。"""
+    if not site_ids:
+        return set()
+    placeholders = ",".join("?" for _ in site_ids)
+    with connect() as con:
+        rows = con.execute(
+            f"SELECT id FROM sites WHERE id IN ({placeholders})", site_ids
+        ).fetchall()
+    return {row["id"] for row in rows}
+
+
+def fetch_latest_analyses_for_sites(site_ids: list[int]) -> dict[int, AnalysisResult]:
+    """批量读取多个站点各自最近一次分析（每个站点取分析 id 最大的一条）。
+
+    返回 {site_id: AnalysisResult}；无分析记录的站点不出现在结果中。
+    """
+    if not site_ids:
+        return {}
+    placeholders = ",".join("?" for _ in site_ids)
+    with connect() as con:
+        rows = con.execute(
+            "SELECT a.* FROM analyses a"
+            " JOIN (SELECT site_id, MAX(id) AS max_id FROM analyses"
+            f"      WHERE site_id IN ({placeholders}) GROUP BY site_id) latest"
+            "  ON a.id = latest.max_id",
+            site_ids,
+        ).fetchall()
+    return {row["site_id"]: _row_to_result(row) for row in rows}

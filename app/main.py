@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Query, status
 from . import database
 from .analysis import (
     analyze,
+    build_cross_site_conflicts,
     build_mitigation_plan,
     build_risk_groups,
     carrier_exclusion_ranges,
@@ -17,8 +18,11 @@ from .schemas import (
     AnalysisMeta,
     AnalysisResult,
     CarrierExclusionResult,
+    CrossSiteConflictsRequest,
+    CrossSiteConflictsResponse,
     MitigationPlan,
     RiskGroup,
+    SiteAnalysisRef,
     SiteCreate,
     SiteOut,
 )
@@ -231,3 +235,57 @@ def get_mitigation_plan(
     if result is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"analysis {analysis_id} not found")
     return build_mitigation_plan(result.products, analysis_id, max_disabled)
+
+
+@app.post(
+    "/cross-site-conflicts",
+    response_model=CrossSiteConflictsResponse,
+    tags=["cross-site"],
+    summary="跨站点互调冲突检测：近频产物配对并按连通分量聚合为冲突簇",
+    description=(
+        "接收 2～8 个已保存站点 ID 与频率容差 tolerance_hz（非负整数 Hz，0 表示仅"
+        "同频配对），读取各站点**最近一次**分析结果（不重新扫描）。在**不同站点**"
+        "的产物之间匹配频率差绝对值不超过容差的全部配对；同一站点的产物即使近频也"
+        "不直接配对，只能经其他站点的配对链式传递。配对图（节点为 (站点, 产物频率)）"
+        "的每个连通分量即一个冲突簇，响应列出每簇涉及站点、产物频率、簇内最小距离与"
+        "全部配对明细。簇按簇内最小 (站点 ID, 产物频率) 升序编号，配对明细按"
+        "(站点 A, 产物 A, 站点 B, 产物 B) 升序，结果稳定可复现。\n\n"
+        "站点 ID 数量不在 2～8、重复、非正整数，或 tolerance_hz 缺失/为负/非整数时"
+        "返回 422；任一站点不存在返回 404；存在但尚无分析记录的站点返回 404。"
+        "无跨站近频配对时返回 200 且 clusters 为空列表。"
+    ),
+)
+def detect_cross_site_conflicts(
+    payload: CrossSiteConflictsRequest,
+) -> CrossSiteConflictsResponse:
+    site_ids = payload.site_ids
+    existing = database.fetch_existing_site_ids(site_ids)
+    missing = sorted(set(site_ids) - existing)
+    if missing:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"site(s) not found: {', '.join(str(s) for s in missing)}",
+        )
+    latest = database.fetch_latest_analyses_for_sites(site_ids)
+    no_analysis = sorted(set(site_ids) - set(latest))
+    if no_analysis:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "no analysis yet for site(s): "
+            + ", ".join(
+                f"{s} (POST /sites/{s}/analysis first)" for s in no_analysis
+            ),
+        )
+    # 保持与请求 site_ids 一致的顺序读取
+    analyses = [latest[site_id] for site_id in site_ids]
+    clusters = build_cross_site_conflicts(analyses, payload.tolerance_hz)
+    return CrossSiteConflictsResponse(
+        site_ids=site_ids,
+        tolerance_hz=payload.tolerance_hz,
+        analyses=[
+            SiteAnalysisRef(site_id=site_id, analysis_id=latest[site_id].analysis_id)
+            for site_id in site_ids
+        ],
+        cluster_count=len(clusters),
+        clusters=clusters,
+    )
