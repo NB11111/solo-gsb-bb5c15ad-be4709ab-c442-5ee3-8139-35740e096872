@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 from .schemas import (
+    AnalysisResult,
+    ConflictCluster,
+    ConflictPair,
+    ConflictProduct,
     ExclusionRange,
     GuardBand,
     HitObject,
@@ -681,3 +685,131 @@ def carrier_exclusion_ranges(
         else:
             merged.append(ExclusionRange(start_hz=lo, end_hz=hi))
     return merged
+
+
+# ------------------------------------------------------------ 跨站点冲突
+
+def build_cross_site_conflicts(
+    analyses: list[AnalysisResult], tolerance_hz: int
+) -> list[ConflictCluster]:
+    """在不同站点的已保存分析产物之间按频率容差配对，并按连通分量聚为冲突簇。
+
+    节点为 (site_id, freq_hz)（同一站点的同频产物只算一个节点）；两个来自
+    不同站点的节点频率差 <= tolerance_hz 时连边。同一站点内的产物不配对，
+    因此不会形成仅由同站点关系构成的桥接。每个连通分量即一个冲突簇，未参与
+    任何配对的产物不属于任何簇。簇按簇内最小 (site_id, freq_hz) 升序排序，
+    cluster_id 从 1 连续编号；无任何配对时返回空列表。
+    """
+    # site_id -> (analysis_id, 该站点产物频率升序去重)
+    per_site: dict[int, tuple[int, list[int]]] = {
+        result.site_id: (
+            result.analysis_id,
+            sorted({p.freq_hz for p in result.products}),
+        )
+        for result in analyses
+    }
+
+    nodes: list[tuple[int, int]] = [
+        (site_id, freq)
+        for site_id in sorted(per_site)
+        for freq in per_site[site_id][1]
+    ]
+
+    # 并查集（节点用其在 nodes 中的下标标识，天然有序）
+    parent = list(range(len(nodes)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]  # 路径压缩
+            i = parent[i]
+        return i
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    raw_edges: list[tuple[tuple[int, int], tuple[int, int], int]] = []
+    # 双站点两两配对；站点数至多 8，直接枚举跨站点节点对
+    site_ids = sorted(per_site)
+    for x in range(len(site_ids)):
+        for y in range(x + 1, len(site_ids)):
+            for freq_a in per_site[site_ids[x]][1]:
+                node_a = (site_ids[x], freq_a)
+                for freq_b in per_site[site_ids[y]][1]:
+                    delta = abs(freq_a - freq_b)
+                    if delta <= tolerance_hz:
+                        node_b = (site_ids[y], freq_b)
+                        # 边的规范方向：频率低者为 a，频率相同则站点 id 小者为 a
+                        if (freq_a, site_ids[x]) <= (freq_b, site_ids[y]):
+                            raw_edges.append((node_a, node_b, delta))
+                        else:
+                            raw_edges.append((node_b, node_a, delta))
+
+    if not raw_edges:
+        return []
+
+    index = {node: i for i, node in enumerate(nodes)}
+    in_edge: set[int] = set()
+    for node_a, node_b, _ in raw_edges:
+        ia, ib = index[node_a], index[node_b]
+        in_edge.add(ia)
+        in_edge.add(ib)
+        union(ia, ib)
+
+    components: dict[int, dict[str, set]] = {}
+    for i in in_edge:
+        node = nodes[i]
+        root = find(i)
+        bucket = components.setdefault(root, {"nodes": set(), "sites": set()})
+        bucket["nodes"].add(node)
+        bucket["sites"].add(node[0])
+
+    cluster_nodes: list[tuple[int, set[tuple[int, int]], set[int]]] = sorted(
+        (
+            (root, bucket["nodes"], bucket["sites"])
+            for root, bucket in components.items()
+        ),
+        key=lambda item: min(item[1]),
+    )
+
+    # 每条边只属于一个连通分量，按根节点一次性归簇
+    edges_by_root: dict[int, list[tuple[tuple[int, int], tuple[int, int], int]]] = {}
+    for edge in raw_edges:
+        edges_by_root.setdefault(find(index[edge[0]]), []).append(edge)
+
+    clusters: list[ConflictCluster] = []
+    for cluster_id, (root, member_nodes, member_sites) in enumerate(
+        cluster_nodes, start=1
+    ):
+        pairs = [
+            ConflictPair(
+                site_a_id=node_a[0],
+                freq_a_hz=node_a[1],
+                site_b_id=node_b[0],
+                freq_b_hz=node_b[1],
+                delta_hz=delta,
+            )
+            for node_a, node_b, delta in sorted(
+                edges_by_root[root],
+                key=lambda e: (e[0][1], e[0][0], e[1][1], e[1][0]),
+            )
+        ]
+        products = [
+            ConflictProduct(
+                site_id=site_id,
+                freq_hz=freq,
+                analysis_id=per_site[site_id][0],
+            )
+            for site_id, freq in sorted(member_nodes)
+        ]
+        clusters.append(
+            ConflictCluster(
+                cluster_id=cluster_id,
+                site_ids=sorted(member_sites),
+                products=products,
+                min_delta_hz=min(p.delta_hz for p in pairs),
+                pairs=pairs,
+            )
+        )
+    return clusters

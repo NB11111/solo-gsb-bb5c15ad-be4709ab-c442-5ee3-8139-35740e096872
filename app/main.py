@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Query, status
 from . import database
 from .analysis import (
     analyze,
+    build_cross_site_conflicts,
     build_mitigation_plan,
     build_risk_groups,
     carrier_exclusion_ranges,
@@ -17,6 +18,8 @@ from .schemas import (
     AnalysisMeta,
     AnalysisResult,
     CarrierExclusionResult,
+    CrossSiteConflictRequest,
+    CrossSiteConflictResponse,
     MitigationPlan,
     RiskGroup,
     SiteCreate,
@@ -231,3 +234,51 @@ def get_mitigation_plan(
     if result is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"analysis {analysis_id} not found")
     return build_mitigation_plan(result.products, analysis_id, max_disabled)
+
+
+@app.post(
+    "/cross-site-conflicts",
+    response_model=CrossSiteConflictResponse,
+    tags=["cross-site"],
+    summary="跨站点互调冲突检测：不同站点产物按频率容差配对并聚合为冲突簇",
+    description=(
+        "接收 2～8 个已保存站点 id 与非负频率容差 tolerance_hz，读取每个站点"
+        "**最近一次**分析结果（不重新扫描、不保存任何数据）。在**不同站点**的"
+        "产物之间，凡频率差 |fa - fb| <= tolerance_hz 即形成一对匹配（同站点内"
+        "不配对）；以匹配关系为无向边、(站点, 产物频率) 为节点取连通分量，"
+        "每个连通分量即一个冲突簇。响应逐簇列出涉及站点、产物频率（含各自"
+        "analysis_id）、簇内最小频率差 min_delta_hz 与全部配对明细；无任何"
+        "匹配时返回空簇列表。站点 id 数量越界、非正或重复、容差非法 -> 422；"
+        "站点不存在 -> 404（列出不存在的 id）；站点尚无分析 -> 404（列出"
+        "缺少分析的站点 id）。"
+    ),
+)
+def detect_cross_site_conflicts(
+    payload: CrossSiteConflictRequest,
+) -> CrossSiteConflictResponse:
+    requested = payload.site_ids
+    existing = database.existing_site_ids(requested)
+    missing_sites = [site_id for site_id in requested if site_id not in existing]
+    if missing_sites:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"site(s) not found: {missing_sites}",
+        )
+    latest = database.fetch_latest_analyses(requested)
+    sites_without_analysis = [site_id for site_id in requested if site_id not in latest]
+    if sites_without_analysis:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"no analysis yet for site(s): {sites_without_analysis};"
+            " POST /sites/{site_id}/analysis first",
+        )
+    # 请求顺序回显；聚类内部按 site_id 规范化，不依赖请求排列
+    analyses = [latest[site_id] for site_id in requested]
+    clusters = build_cross_site_conflicts(analyses, payload.tolerance_hz)
+    return CrossSiteConflictResponse(
+        tolerance_hz=payload.tolerance_hz,
+        site_ids=requested,
+        cluster_count=len(clusters),
+        pair_count=sum(len(cluster.pairs) for cluster in clusters),
+        clusters=clusters,
+    )

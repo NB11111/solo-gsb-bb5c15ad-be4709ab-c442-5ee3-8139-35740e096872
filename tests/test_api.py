@@ -586,3 +586,329 @@ def test_mitigation_plan_uses_persisted_result(client):
 
 def test_health(client):
     assert client.get("/health").json() == {"status": "ok"}
+
+
+# ---------------------------------------------------------------- 跨站点互调冲突
+
+def make_sites_and_analyze(client, carriers_by_name):
+    """按给定 {name: carriers} 依次创建站点并执行分析，返回 [site_id, ...]。"""
+    ids = []
+    for name, carriers in carriers_by_name.items():
+        resp = client.post(
+            "/sites", json=make_payload(name=name, carriers_hz=list(carriers))
+        )
+        assert resp.status_code == 201, resp.text
+        site_id = resp.json()["id"]
+        assert client.post(f"/sites/{site_id}/analysis").status_code == 201
+        ids.append(site_id)
+    return ids
+
+
+def _make_sites_without_analysis(client, names):
+    ids = []
+    for name in names:
+        resp = client.post("/sites", json=make_payload(name=name))
+        assert resp.status_code == 201, resp.text
+        ids.append(resp.json()["id"])
+    return ids
+
+
+def test_cross_site_conflicts_single_pair_basic(client):
+    # 站点 a 产物含 500，站点 b 产物含 510：容差 20 配对，10 也配对（<= 边界），
+    # 9 不配对
+    ids = make_sites_and_analyze(client, {"a": [100, 300, 400], "b": [1000, 1490]})
+    resp = client.post(
+        "/cross-site-conflicts", json={"site_ids": ids, "tolerance_hz": 20}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["tolerance_hz"] == 20
+    assert body["site_ids"] == ids  # 按请求顺序回显
+    assert body["cluster_count"] == 1
+    assert body["pair_count"] == 1
+    assert body["clusters"] == [
+        {
+            "cluster_id": 1,
+            "site_ids": ids,
+            "products": [
+                {"site_id": ids[0], "freq_hz": 500, "analysis_id": 1},
+                {"site_id": ids[1], "freq_hz": 510, "analysis_id": 2},
+            ],
+            "min_delta_hz": 10,
+            "pairs": [
+                {
+                    "site_a_id": ids[0],
+                    "freq_a_hz": 500,
+                    "site_b_id": ids[1],
+                    "freq_b_hz": 510,
+                    "delta_hz": 10,
+                }
+            ],
+        }
+    ]
+
+    boundary = client.post(
+        "/cross-site-conflicts", json={"site_ids": ids, "tolerance_hz": 10}
+    ).json()
+    assert boundary["cluster_count"] == 1  # 差恰好等于容差也算配对（闭区间语义）
+
+    none = client.post(
+        "/cross-site-conflicts", json={"site_ids": ids, "tolerance_hz": 9}
+    ).json()
+    assert none == {
+        "tolerance_hz": 9,
+        "site_ids": ids,
+        "cluster_count": 0,
+        "pair_count": 0,
+        "clusters": [],
+    }
+
+
+def test_cross_site_conflicts_chain_merges_into_one_cluster(client):
+    # 500@a - 510@b - 520@c：500 与 520 差 20 但隔了站点 b，经链式配对仍归一簇
+    ids = make_sites_and_analyze(
+        client,
+        {"a": [100, 300, 400], "b": [1000, 1490], "c": [480, 500]},
+    )
+    body = client.post(
+        "/cross-site-conflicts", json={"site_ids": ids, "tolerance_hz": 10}
+    ).json()
+    assert body["cluster_count"] == 1
+    assert body["pair_count"] == 2
+    cluster = body["clusters"][0]
+    assert cluster["site_ids"] == ids
+    assert cluster["min_delta_hz"] == 10
+    assert [(p["site_id"], p["freq_hz"]) for p in cluster["products"]] == [
+        (ids[0], 500),
+        (ids[1], 510),
+        (ids[2], 520),
+    ]
+    # 配对按 (freq_a, site_a, freq_b, site_b) 升序
+    assert [
+        (pair["freq_a_hz"], pair["site_a_id"], pair["freq_b_hz"], pair["site_b_id"])
+        for pair in cluster["pairs"]
+    ] == [
+        (500, ids[0], 510, ids[1]),
+        (510, ids[1], 520, ids[2]),
+    ]
+
+
+def test_cross_site_conflicts_two_clusters_via_shared_site(client):
+    # 站点 a 产物 500、700；站点 b 产物 510、1980；站点 c 产物 1900。
+    # 容差 80：a500-b510 成一簇；b1980-c1900 成另一簇；a700 无配对不入簇。
+    # 两簇都涉及站点 b 但彼此没有可传递的配对，仍为两个独立分量。
+    ids = make_sites_and_analyze(
+        client,
+        {"a": [100, 300, 400], "b": [1000, 1490], "c": [300, 1100]},
+    )
+    body = client.post(
+        "/cross-site-conflicts", json={"site_ids": ids, "tolerance_hz": 80}
+    ).json()
+    assert body["cluster_count"] == 2
+    assert body["pair_count"] == 2
+    first, second = body["clusters"]
+    assert first["site_ids"] == [ids[0], ids[1]]
+    assert [(p["site_id"], p["freq_hz"]) for p in first["products"]] == [
+        (ids[0], 500),
+        (ids[1], 510),
+    ]
+    assert first["min_delta_hz"] == 10
+    assert second["site_ids"] == [ids[1], ids[2]]
+    assert [(p["site_id"], p["freq_hz"]) for p in second["products"]] == [
+        (ids[1], 1980),
+        (ids[2], 1900),
+    ]
+    assert second["min_delta_hz"] == 80
+    # 容差 9：500/510（差 10）与 1900/1980（差 80）都不再配对，无冲突簇
+    tight = client.post(
+        "/cross-site-conflicts", json={"site_ids": ids, "tolerance_hz": 9}
+    ).json()
+    assert tight["cluster_count"] == 0
+
+
+def test_cross_site_conflicts_two_disjoint_clusters_numbering(client):
+    # 独立构造两簇：簇1 频率 ~500（站点 1/2），簇2 频率 ~700（站点 3/4），
+    # 各站点只用一对载频精确产生目标产物，避免同站点额外产物桥接。
+    ids = make_sites_and_analyze(
+        client,
+        {
+            "s1": [300, 100],     # 500
+            "s2": [300, 90],      # 510
+            "s3": [400, 100],     # 700（同时产生 2*100-400=-200 越界被过滤）
+            "s4": [400, 95],      # 705
+        },
+    )
+    body = client.post(
+        "/cross-site-conflicts", json={"site_ids": ids, "tolerance_hz": 10}
+    ).json()
+    assert body["cluster_count"] == 2
+    assert body["pair_count"] == 2
+    first, second = body["clusters"]
+    assert first["cluster_id"] == 1
+    assert first["site_ids"] == [ids[0], ids[1]]
+    assert [p["freq_hz"] for p in first["products"]] == [500, 510]
+    assert first["min_delta_hz"] == 10
+    assert second["cluster_id"] == 2
+    assert second["site_ids"] == [ids[2], ids[3]]
+    assert [p["freq_hz"] for p in second["products"]] == [700, 705]
+    assert second["min_delta_hz"] == 5
+    # 调小容差只剩 700/705 一簇（500/510 差 10 被拆开）
+    tight = client.post(
+        "/cross-site-conflicts", json={"site_ids": ids, "tolerance_hz": 7}
+    ).json()
+    assert tight["cluster_count"] == 1
+    assert tight["clusters"][0]["cluster_id"] == 1
+    assert tight["clusters"][0]["products"][0]["freq_hz"] == 700
+
+
+def test_cross_site_conflicts_same_site_products_never_pair(client):
+    # 站点 a 产物 500 与 700（同站差 200 <= 容差也不得配对/桥接）；
+    # 站点 b 产物 510：跨站对为 a500-b510(10) 与 a700-b510(190)，200@a 不入簇
+    ids = make_sites_and_analyze(client, {"a": [100, 300, 400], "b": [1000, 1490]})
+    body = client.post(
+        "/cross-site-conflicts", json={"site_ids": ids, "tolerance_hz": 300}
+    ).json()
+    cluster = body["clusters"][0]
+    assert sorted((p["site_id"], p["freq_hz"]) for p in cluster["products"]) == [
+        (ids[0], 500),
+        (ids[0], 700),
+        (ids[1], 510),
+    ]
+    # 每一对的两端必须来自不同站点
+    for pair in cluster["pairs"]:
+        assert pair["site_a_id"] != pair["site_b_id"]
+    assert {
+        (pair["freq_a_hz"], pair["freq_b_hz"], pair["delta_hz"])
+        for pair in cluster["pairs"]
+    } == {(500, 510, 10), (510, 700, 190)}
+    assert cluster["min_delta_hz"] == 10
+
+
+def test_cross_site_conflicts_pair_orientation_on_equal_freq(client):
+    # 两站点产生完全同频产物 500：delta=0，频率相同时站点 id 小者为 a
+    ids = make_sites_and_analyze(client, {"a": [300, 100], "b": [300, 100]})
+    body = client.post(
+        "/cross-site-conflicts", json={"site_ids": ids, "tolerance_hz": 0}
+    ).json()
+    assert body["cluster_count"] == 1
+    pair = body["clusters"][0]["pairs"][0]
+    assert pair == {
+        "site_a_id": ids[0],
+        "freq_a_hz": 500,
+        "site_b_id": ids[1],
+        "freq_b_hz": 500,
+        "delta_hz": 0,
+    }
+
+
+def test_cross_site_conflicts_request_order_independence(client):
+    ids = make_sites_and_analyze(
+        client,
+        {"s1": [300, 100], "s2": [300, 90], "s3": [400, 100], "s4": [400, 95]},
+    )
+    first = client.post(
+        "/cross-site-conflicts", json={"site_ids": ids, "tolerance_hz": 10}
+    ).json()
+    reversed_ids = list(reversed(ids))
+    second = client.post(
+        "/cross-site-conflicts", json={"site_ids": reversed_ids, "tolerance_hz": 10}
+    ).json()
+    # site_ids 按各自请求顺序回显；簇结构与编号完全一致
+    assert first["site_ids"] == ids
+    assert second["site_ids"] == reversed_ids
+    assert first["clusters"] == second["clusters"]
+
+
+def test_cross_site_conflicts_uses_latest_analysis(client, monkeypatch):
+    # 读取每个站点“最近一次”分析：直接向库中写入一条更新的空结果分析后，
+    # 端点应基于它判定无冲突；补一次正式分析后冲突恢复
+    ids = make_sites_and_analyze(client, {"a": [300, 100], "b": [300, 90]})
+    before = client.post(
+        "/cross-site-conflicts", json={"site_ids": ids, "tolerance_hz": 10}
+    ).json()
+    assert before["cluster_count"] == 1
+
+    from app import database
+
+    database.insert_analysis(ids[1], [])  # 站点 b 的最新分析无产物
+    mid = client.post(
+        "/cross-site-conflicts", json={"site_ids": ids, "tolerance_hz": 10}
+    ).json()
+    assert mid["cluster_count"] == 0
+
+    client.post(f"/sites/{ids[1]}/analysis")  # 新的正式分析成为最新
+    after = client.post(
+        "/cross-site-conflicts", json={"site_ids": ids, "tolerance_hz": 10}
+    ).json()
+    assert after["cluster_count"] == 1
+
+
+def test_cross_site_conflicts_does_not_write_anything(client):
+    ids = make_sites_and_analyze(client, {"a": [300, 100], "b": [300, 90]})
+    metas_before = [client.get(f"/sites/{i}/analyses").json() for i in ids]
+    for _ in range(2):
+        resp = client.post(
+            "/cross-site-conflicts", json={"site_ids": ids, "tolerance_hz": 10}
+        )
+        assert resp.status_code == 200
+    metas_after = [client.get(f"/sites/{i}/analyses").json() for i in ids]
+    assert metas_before == metas_after  # 纯读端点：不新增分析记录
+
+
+def test_cross_site_conflicts_missing_sites_404(client):
+    ids = make_sites_and_analyze(client, {"a": [300, 100]})
+    # 全部不存在
+    resp = client.post(
+        "/cross-site-conflicts", json={"site_ids": [998, 999], "tolerance_hz": 1}
+    )
+    assert resp.status_code == 404
+    assert "998" in resp.json()["detail"] and "999" in resp.json()["detail"]
+    # 部分不存在：明确列出缺失 id，且不进行分析检查
+    resp = client.post(
+        "/cross-site-conflicts", json={"site_ids": [ids[0], 999], "tolerance_hz": 1}
+    )
+    assert resp.status_code == 404
+    assert "999" in resp.json()["detail"]
+
+
+def test_cross_site_conflicts_sites_without_analysis_404(client):
+    analyzed = _make_sites_without_analysis(client, ["a", "b"])
+    client.post(f"/sites/{analyzed[0]}/analysis")  # 只有站点 a 有分析
+    resp = client.post(
+        "/cross-site-conflicts",
+        json={"site_ids": analyzed, "tolerance_hz": 1},
+    )
+    assert resp.status_code == 404
+    detail = resp.json()["detail"]
+    assert str(analyzed[1]) in detail  # 明确指出缺分析的站点
+    assert str(analyzed[0]) not in detail
+
+
+def test_cross_site_conflicts_validation_422(client):
+    ids = make_sites_and_analyze(client, {"a": [300, 100], "b": [300, 90]})
+    url = "/cross-site-conflicts"
+
+    def post(body):
+        return client.post(url, json=body)
+
+    # 站点数少于 2 / 多于 8
+    assert post({"site_ids": [ids[0]], "tolerance_hz": 1}).status_code == 422
+    assert post(
+        {"site_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9], "tolerance_hz": 1}
+    ).status_code == 422
+    # 重复站点 id
+    assert post({"site_ids": [ids[0], ids[0]], "tolerance_hz": 1}).status_code == 422
+    # 非正站点 id
+    assert post({"site_ids": [0, ids[0]], "tolerance_hz": 1}).status_code == 422
+    assert post({"site_ids": [ids[0], -3], "tolerance_hz": 1}).status_code == 422
+    # 容差缺失 / 负数
+    assert post({"site_ids": ids}).status_code == 422
+    assert post({"site_ids": ids, "tolerance_hz": -1}).status_code == 422
+    # 请求体缺失 / 字段类型错误
+    assert client.post(url, json={}).status_code == 422
+    assert post({"site_ids": ["a", "b"], "tolerance_hz": 1}).status_code == 422
+    assert post({"site_ids": ids, "tolerance_hz": "x"}).status_code == 422
+    # 恰好 8 个站点的数量上限本身合法（存在性另算 404）；2 个下限已由其它用例覆盖
+    assert post(
+        {"site_ids": [ids[0], ids[1], 3, 4, 5, 6, 7, 8], "tolerance_hz": 1}
+    ).status_code == 404

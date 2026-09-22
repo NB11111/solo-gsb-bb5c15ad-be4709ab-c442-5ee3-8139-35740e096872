@@ -107,6 +107,63 @@ docker compose up --build
 }
 ```
 
+## 跨站点互调冲突（cross-site conflicts）
+
+`POST /cross-site-conflicts` 接收 **2～8 个已保存站点 id** 与非负频率容差
+`tolerance_hz`，读取每个站点**最近一次**分析结果（纯读端点：不重新扫描、不保存任何数据）。
+
+请求体：
+
+```json
+{"site_ids": [1, 2, 3], "tolerance_hz": 20}
+```
+
+- **配对规则**：在**不同站点**的产物之间，凡频率差 `|fa − fb| ≤ tolerance_hz`
+  即形成一对匹配（闭区间语义：差恰好等于容差也算配对）。**同一站点内的产物不配对**，
+  因而同站点关系不会把两个簇桥接起来；容差为 `0` 时只匹配严格同频的跨站点产物。
+- **连通分量聚簇**：以匹配关系为无向边、`(站点, 产物频率)` 为节点取连通分量，
+  每个连通分量即一个冲突簇——`500@A ↔ 510@B ↔ 520@C` 这类链式匹配全部归入同一簇，
+  即使 `500` 与 `520` 的差已超出容差。未参与任何配对的产物不属于任何簇；无配对时返回空簇列表。
+- **每簇字段**：
+  - `site_ids`：簇内涉及的站点 id（升序）；
+  - `products`：簇内全部产物，含各自的 `site_id`、`freq_hz` 与其来源 `analysis_id`，
+    按 `(site_id, freq_hz)` 升序；
+  - `min_delta_hz`：簇内全部配对的**最小频率差**（最接近的一对）；
+  - `pairs`：全部配对明细，频率低者为 a、频率相同则站点 id 小者为 a，
+    按 `(freq_a_hz, site_a_id, freq_b_hz, site_b_id)` 升序。
+- **稳定编号**：簇按簇内最小 `(site_id, freq_hz)` 升序排序后 `cluster_id` 从 1 连续编号；
+  结果只取决于各站点数据，与请求中站点 id 的排列顺序无关（`site_ids` 顶层字段按请求顺序回显）。
+- **错误响应**：
+  - 站点 id 少于 2、多于 8、非正整数或重复，`tolerance_hz` 缺失/负数/非整数 → `422`；
+  - 站点不存在 → `404`，`detail` 列出不存在的 id；
+  - 站点存在但尚无分析 → `404`，`detail` 列出缺少分析的站点 id
+    （先 `POST /sites/{site_id}/analysis`）。
+
+响应示例（站点 1 产物含 500 Hz、站点 2 产物含 510 Hz，容差 20 Hz）：
+
+```json
+{
+  "tolerance_hz": 20,
+  "site_ids": [1, 2],
+  "cluster_count": 1,
+  "pair_count": 1,
+  "clusters": [
+    {
+      "cluster_id": 1,
+      "site_ids": [1, 2],
+      "products": [
+        {"site_id": 1, "freq_hz": 500, "analysis_id": 1},
+        {"site_id": 2, "freq_hz": 510, "analysis_id": 4}
+      ],
+      "min_delta_hz": 10,
+      "pairs": [
+        {"site_a_id": 1, "freq_a_hz": 500, "site_b_id": 2, "freq_b_hz": 510, "delta_hz": 10}
+      ]
+    }
+  ]
+}
+```
+
 ## 校验规则（整批拒绝）
 
 - 载频必须为正整数 Hz 且**不得重复**；至少 1 个载频。
@@ -131,6 +188,7 @@ docker compose up --build
 | `GET` | `/analyses/{analysis_id}` | 按 id 查询已保存的分析结果 |
 | `GET` | `/analyses/{analysis_id}/risk-groups` | 按已保存分析结果生成风险分组（违规产物 ↔ 来源载频的二部图连通分量） |
 | `GET` | `/analyses/{analysis_id}/mitigation-plan?max_disabled=k` | 按已保存分析结果求最小停用载频集合（精确最小点覆盖，`max_disabled` 取 1～8；上限内无解返回 `feasible=false` 与未消除产物频率） |
+| `POST` | `/cross-site-conflicts` | 跨站点冲突检测：不同站点最近分析产物按 `tolerance_hz` 配对，连通分量聚合为冲突簇（2～8 个站点 id；站点不存在或无分析 → 404，参数非法/重复 → 422） |
 
 ### 示例
 
@@ -162,6 +220,11 @@ curl 'http://localhost:8000/analyses/1/mitigation-plan?max_disabled=2'
 
 # 查询候选范围 [1, 10000] 内不宜新增载频的区间（不执行或保存分析）
 curl 'http://localhost:8000/sites/1/carrier-exclusion-ranges?candidate_start_hz=1&candidate_end_hz=10000'
+
+# 跨站点冲突检测（先确保各站点都已执行过分析）
+curl -X POST http://localhost:8000/cross-site-conflicts \
+  -H 'Content-Type: application/json' \
+  -d '{"site_ids": [1, 2, 3], "tolerance_hz": 20}'
 ```
 
 分析响应节选：
@@ -230,7 +293,7 @@ curl 'http://localhost:8000/sites/1/carrier-exclusion-ranges?candidate_start_hz=
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-# 运行测试（36 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、新增载频禁用区间）
+# 运行测试（48 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、新增载频禁用区间、跨站点冲突检测）
 pytest
 
 # 启动服务，API 位于 http://127.0.0.1:8000
@@ -248,8 +311,8 @@ uvicorn app.main:app --reload
 ```
 app/
   main.py       # FastAPI 应用与路由，启动时初始化数据库
-  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）、停用方案（精确最小点覆盖）、新增载频禁用区间反解
-  database.py   # SQLite 建表与读写（单事务批量写入）
+  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）、停用方案（精确最小点覆盖）、新增载频禁用区间反解、跨站点冲突配对聚簇
+  database.py   # SQLite 建表与读写（单事务批量写入，批量读取多站点最近分析）
   schemas.py    # Pydantic 请求/响应模型与校验
 tests/
   test_api.py   # 端到端测试（TestClient + 临时数据库）

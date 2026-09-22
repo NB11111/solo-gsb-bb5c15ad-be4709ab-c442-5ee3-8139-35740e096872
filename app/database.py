@@ -199,3 +199,36 @@ def list_analyses(site_id: int) -> list[AnalysisMeta]:
         )
         for r in rows
     ]
+
+
+def existing_site_ids(site_ids: list[int]) -> set[int]:
+    """返回给定站点 id 中实际存在的子集（单条查询，去重）。"""
+    unique_ids = list(set(site_ids))
+    if not unique_ids:
+        return set()
+    placeholders = ",".join("?" for _ in unique_ids)
+    with connect() as con:
+        rows = con.execute(
+            f"SELECT id FROM sites WHERE id IN ({placeholders})", unique_ids
+        ).fetchall()
+    return {r["id"] for r in rows}
+
+
+def fetch_latest_analyses(site_ids: list[int]) -> dict[int, AnalysisResult]:
+    """一次性读取多个站点各自最近一次分析；无分析记录的站点不在返回值中。
+
+    用相关子查询按 id 取每个站点最大的分析行（SQLite 兼容，不依赖
+    DISTINCT/窗口函数），全部读取在单个连接/事务内完成。
+    """
+    unique_ids = list(set(site_ids))
+    if not unique_ids:
+        return {}
+    placeholders = ",".join("?" for _ in unique_ids)
+    with connect() as con:
+        rows = con.execute(
+            "SELECT a.* FROM analyses a"
+            " WHERE a.id = (SELECT MAX(id) FROM analyses WHERE site_id = a.site_id)"
+            f" AND a.site_id IN ({placeholders})",
+            unique_ids,
+        ).fetchall()
+    return {row["site_id"]: _row_to_result(row) for row in rows}

@@ -151,3 +151,69 @@ class CarrierExclusionResult(BaseModel):
     exclusion_ranges: list[ExclusionRange] = Field(
         ..., description="不宜新增载频的闭区间，按起点升序，互不重叠且互不相邻"
     )
+
+
+# ---------------------------------------------------------- 跨站点互调冲突
+
+class CrossSiteConflictRequest(BaseModel):
+    """跨站点冲突检测请求：2～8 个已保存站点 id 与频率容差。"""
+
+    site_ids: list[int] = Field(
+        ..., min_length=2, max_length=8, description="参与比对的站点 id 列表，取 2～8 个，不允许重复"
+    )
+    tolerance_hz: int = Field(
+        ..., ge=0, description="频率容差（非负整数 Hz）：不同站点产物频率差不超过该值即配对"
+    )
+
+    @field_validator("site_ids")
+    @classmethod
+    def _check_site_ids(cls, v: list[int]) -> list[int]:
+        if any(site_id <= 0 for site_id in v):
+            raise ValueError("site ids must be positive integers")
+        if len(set(v)) != len(v):
+            raise ValueError("duplicate site ids are not allowed")
+        return v
+
+
+class ConflictProduct(BaseModel):
+    """冲突簇内来自某个站点分析的一个产物频率。"""
+
+    site_id: int
+    freq_hz: int = Field(..., description="产物频率，整数 Hz")
+    analysis_id: int = Field(..., description="该站点最近一次分析的 id")
+
+
+class ConflictPair(BaseModel):
+    """一对跨站点匹配产物：来自不同站点，频率差不超过容差。"""
+
+    site_a_id: int = Field(..., description="频率较低一侧产物所属站点 id（频率相同取较小站点 id）")
+    freq_a_hz: int
+    site_b_id: int = Field(..., description="频率较高一侧产物所属站点 id（频率相同取较大站点 id）")
+    freq_b_hz: int
+    delta_hz: int = Field(..., description="两产物频率差 |freq_b_hz - freq_a_hz|，整数 Hz")
+
+
+class ConflictCluster(BaseModel):
+    """一个冲突簇：配对关系图上的一个连通分量。"""
+
+    cluster_id: int = Field(
+        ..., description="簇编号：按簇内最小 (site_id, freq_hz) 升序排序后从 1 连续编号"
+    )
+    site_ids: list[int] = Field(..., description="簇内涉及的站点 id，升序")
+    products: list[ConflictProduct] = Field(
+        ..., description="簇内全部产物，按 (site_id, freq_hz) 升序"
+    )
+    min_delta_hz: int = Field(..., description="簇内全部配对的最小频率差（最接近的一对），整数 Hz")
+    pairs: list[ConflictPair] = Field(
+        ..., description="簇内全部跨站点配对，按 (freq_a_hz, site_a_id, freq_b_hz, site_b_id) 升序"
+    )
+
+
+class CrossSiteConflictResponse(BaseModel):
+    """跨站点冲突检测结果：按配对连通分量聚合的冲突簇。"""
+
+    tolerance_hz: int
+    site_ids: list[int] = Field(..., description="参与比对的站点 id，按请求给出的顺序回显")
+    cluster_count: int
+    pair_count: int = Field(..., description="全部簇内跨站点配对总数")
+    clusters: list[ConflictCluster] = Field(..., description="冲突簇，按 cluster_id 升序")
